@@ -6,7 +6,7 @@
 use std::error::Error;
 use std::io::{BufReader, BufWriter, Read, Write};
 
-use crossbeam::channel::{self, unbounded};
+use crossbeam::channel::{self, bounded, unbounded};
 
 ///
 /// Set the indentation used for the formatting.
@@ -57,12 +57,12 @@ where
     let mut indent_level = 0usize;
     let mut newline_requested = false; // invalidated if next character is ] or }
 
-    let (snd, rcv) = unbounded();
+    let (snd, rcv) = bounded(1024);
 
     crossbeam::scope(|s| {
-        s.spawn(|_| -> Result<(), std::io::Error> {
+        s.spawn(|_| {
             for char in reader.bytes() {
-                let char = char?;
+                let char = char.unwrap();
                 if in_string {
                     let mut escape_here = false;
                     match char {
@@ -130,14 +130,13 @@ where
                 }
             }
             drop(snd);
-            Ok(())
         });
+
+        for value in rcv.iter() {
+            writer.write_all(&[value]).unwrap();
+        }
     })
     .unwrap();
-
-    while let Ok(value) = rcv.recv() {
-        writer.write_all(&[value])?;
-    }
 
     Ok(())
 }
