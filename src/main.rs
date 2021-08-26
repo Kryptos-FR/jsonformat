@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     )
     .get_matches();
 
-    let reader: Box<dyn Read> = match matches.value_of("input") {
+    let reader: Box<dyn Read + Send> = match matches.value_of("input") {
         Some(path) => Box::new(File::open(path)?),
         None => Box::new(std::io::stdin()),
     };

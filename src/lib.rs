@@ -6,6 +6,8 @@
 use std::error::Error;
 use std::io::{BufReader, BufWriter, Read, Write};
 
+use crossbeam::channel::{self, unbounded};
+
 ///
 /// Set the indentation used for the formatting.
 ///
@@ -47,7 +49,7 @@ pub fn format_json_buffered<R, W>(
     indentation: Indentation,
 ) -> Result<(), Box<dyn Error>>
 where
-    R: Read,
+    R: Read + Send,
     W: Write,
 {
     let mut escaped = false;
@@ -55,98 +57,105 @@ where
     let mut indent_level = 0usize;
     let mut newline_requested = false; // invalidated if next character is ] or }
 
-    for char in reader.bytes() {
-        let char = char?;
-        if in_string {
-            let mut escape_here = false;
-            match char {
-                b'"' => {
-                    if !escaped {
-                        in_string = false;
-                    }
-                }
-                b'\\' => {
-                    if !escaped {
-                        escape_here = true;
-                    }
-                }
-                _ => {}
-            }
-            writer.write_all(&[char])?;
-            escaped = escape_here;
-        } else {
-            let mut auto_push = true;
-            let mut request_newline = false;
-            let old_level = indent_level;
+    let (snd, rcv) = unbounded();
 
-            match char {
-                b'"' => in_string = true,
-                b' ' | b'\n' | b'\t' => continue,
-                b'[' => {
-                    indent_level += 1;
-                    request_newline = true;
-                }
-                b'{' => {
-                    indent_level += 1;
-                    request_newline = true;
-                }
-                b'}' | b']' => {
-                    indent_level = indent_level.saturating_sub(1);
-                    if !newline_requested {
-                        // see comment below about newline_requested
-                        writer.write_all(&[b'\n'])?;
-                        indent_buffered(writer, indent_level, indentation)?;
+    crossbeam::scope(|s| {
+        s.spawn(|_| -> Result<(), std::io::Error> {
+            for char in reader.bytes() {
+                let char = char?;
+                if in_string {
+                    let mut escape_here = false;
+                    match char {
+                        b'"' => {
+                            if !escaped {
+                                in_string = false;
+                            }
+                        }
+                        b'\\' => {
+                            if !escaped {
+                                escape_here = true;
+                            }
+                        }
+                        _ => {}
                     }
-                }
-                b':' => {
-                    auto_push = false;
-                    writer.write_all(&[char])?;
-                    writer.write_all(&[b' '])?;
-                }
-                b',' => {
-                    request_newline = true;
-                }
-                _ => {}
-            }
-            if newline_requested && char != b']' && char != b'}' {
-                // newline only happens after { [ and ,
-                // this means we can safely assume that it being followed up by } or ]
-                // means an empty object/array
-                writer.write_all(&[b'\n'])?;
-                indent_buffered(writer, old_level, indentation)?;
-            }
+                    snd.send(char).unwrap();
+                    escaped = escape_here;
+                } else {
+                    let mut auto_push = true;
+                    let mut request_newline = false;
+                    let old_level = indent_level;
 
-            if auto_push {
-                writer.write_all(&[char])?;
-            }
+                    match char {
+                        b'"' => in_string = true,
+                        b' ' | b'\n' | b'\t' => continue,
+                        b'[' => {
+                            indent_level += 1;
+                            request_newline = true;
+                        }
+                        b'{' => {
+                            indent_level += 1;
+                            request_newline = true;
+                        }
+                        b'}' | b']' => {
+                            indent_level = indent_level.saturating_sub(1);
+                            if !newline_requested {
+                                // see comment below about newline_requested
+                                snd.send(b'\n').unwrap();
+                                indent_buffered(&snd, indent_level, &indentation);
+                            }
+                        }
+                        b':' => {
+                            auto_push = false;
+                            snd.send(char).unwrap();
+                            snd.send(b' ').unwrap();
+                        }
+                        b',' => {
+                            request_newline = true;
+                        }
+                        _ => {}
+                    }
+                    if newline_requested && char != b']' && char != b'}' {
+                        // newline only happens after { [ and ,
+                        // this means we can safely assume that it being followed up by } or ]
+                        // means an empty object/array
+                        snd.send(b'\n').unwrap();
+                        indent_buffered(&snd, old_level, &indentation);
+                    }
 
-            newline_requested = request_newline;
-        }
+                    if auto_push {
+                        snd.send(char).unwrap();
+                    }
+
+                    newline_requested = request_newline;
+                }
+            }
+            drop(snd);
+            Ok(())
+        });
+    })
+    .unwrap();
+
+    while let Ok(value) = rcv.recv() {
+        writer.write_all(&[value])?;
     }
 
     Ok(())
 }
 
-fn indent_buffered<W>(
-    writer: &mut BufWriter<W>,
-    level: usize,
-    indent_str: Indentation,
-) -> Result<(), Box<dyn Error>>
-where
-    W: std::io::Write,
-{
+fn indent_buffered(tx: &channel::Sender<u8>, level: usize, indent_str: &Indentation) {
     for _ in 0..level {
         match indent_str {
             Indentation::Default => {
-                writer.write_all(b"  ")?;
+                tx.send(b' ').unwrap();
+                tx.send(b' ').unwrap();
             }
             Indentation::Custom(indent) => {
-                writer.write_all(indent.as_bytes())?;
+                for b in indent.as_bytes() {
+                    tx.send(*b).unwrap();
+                }
             }
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
